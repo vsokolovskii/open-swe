@@ -1,63 +1,42 @@
-import { useEffect, useMemo, useState } from "react"
-import { useQueryClient } from "@tanstack/react-query"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { useStreamContext as useAgentThreadStream } from "@langchain/react"
 
 import type { PendingPrompt } from "@/lib/agents/pendingPrompts"
 import type { AgentThread, Message } from "@/lib/agents/types"
-import type { ModelSelection } from "@/lib/agents/useModelOptions"
+import type { ModelSelection } from "@/lib/agents/provider/useModelOptions"
 import { AgentPromptBar } from "@/components/agents/AgentPromptBar"
 import { MessageView } from "@/components/agents/ported"
-import { agentThreadKeys, useSendAgentMessage } from "@/lib/agents/queries"
+import { AgentThreadStreamProvider } from "@/lib/agents/AgentThreadStreamProvider"
+import { streamMessagesToUi } from "@/lib/agents/streamMessagesToUi"
 import {
   dropPendingPrompts,
   getPendingPrompts,
 } from "@/lib/agents/pendingPrompts"
-import { useAgentThreadStream } from "@/lib/agents/useThreadStream"
-import { useModelOptions } from "@/lib/agents/useModelOptions"
+import {
+  submitAgentPrompt,
+  useSubmitAgentMessage,
+} from "@/lib/agents/provider/useSubmitAgentMessage"
+import { useModelOptions } from "@/lib/agents/provider/useModelOptions"
 
 interface AgentThreadViewProps {
   thread: AgentThread
 }
 
-function messageText(message: Message): string {
-  return message.chunks
-    .filter((chunk) => chunk.kind === "text")
-    .map((chunk) => chunk.text)
-    .join("")
-}
-
-function messageImageKey(message: Message): string {
-  return message.chunks
-    .filter((chunk) => chunk.kind === "image")
-    .map((chunk) => `${chunk.mimeType}:${chunk.base64}`)
-    .join("\u0000")
-}
-
-function pendingImageKey(entry: PendingPrompt): string {
-  return (entry.images ?? [])
-    .map((image) => `${image.mimeType}:${image.base64}`)
-    .join("\u0000")
-}
-
-function isPendingPromptConfirmed(
-  entry: PendingPrompt,
-  messages: Array<Message>
-): boolean {
-  return messages.slice(entry.insertAt).some((message) => {
-    if (message.author !== "user") return false
-    return (
-      messageText(message) === entry.prompt &&
-      messageImageKey(message) === pendingImageKey(entry)
-    )
-  })
-}
-
 export function AgentThreadView({ thread }: AgentThreadViewProps) {
-  const queryClient = useQueryClient()
-  const sendMessage = useSendAgentMessage(thread.id)
-  useAgentThreadStream(thread.id, thread.status === "running")
+  return (
+    <AgentThreadStreamProvider threadId={thread.id}>
+      <AgentThreadViewContent thread={thread} />
+    </AgentThreadStreamProvider>
+  )
+}
+
+function AgentThreadViewContent({ thread }: AgentThreadViewProps) {
+  const sendMessage = useSubmitAgentMessage(thread.id)
+  const stream = useAgentThreadStream()
   const [pendingPrompts, setPendingPrompts] = useState<Array<PendingPrompt>>(
     () => getPendingPrompts(thread.id)
   )
+  const pendingSubmitStarted = useRef(false)
 
   const { models, defaultSelection } = useModelOptions()
   const threadSelection = useMemo<ModelSelection | null>(() => {
@@ -72,31 +51,65 @@ export function AgentThreadView({ thread }: AgentThreadViewProps) {
   const activeSelection = selection ?? threadSelection ?? defaultSelection
 
   useEffect(() => {
+    if (pendingPrompts.length === 0) return
+    if (stream.isLoading || stream.isThreadLoading) return
+    if (pendingSubmitStarted.current) return
+
+    const entry = pendingPrompts[0]
+    if (!entry) return
+    pendingSubmitStarted.current = true
+    void submitAgentPrompt(stream, {
+      content: entry.prompt,
+      images: entry.images,
+      model_id: entry.modelId ?? activeSelection?.modelId ?? null,
+      effort: entry.effort ?? activeSelection?.effort ?? null,
+    })
+      .catch(() => {
+        pendingSubmitStarted.current = false
+      })
+      .finally(() => {
+        pendingSubmitStarted.current = false
+      })
+  }, [
+    pendingPrompts,
+    activeSelection?.effort,
+    activeSelection?.modelId,
+    stream,
+    stream.isLoading,
+    stream.isThreadLoading,
+  ])
+
+  const baseMessages = useMemo<Array<Message>>(() => {
+    const live = streamMessagesToUi(stream.messages)
+    if (live.length > 0 || stream.isLoading) return live
+    return thread.messages
+  }, [stream.isLoading, stream.messages, thread.messages])
+
+  const userMessageTexts = useMemo(() => {
+    return new Set(
+      baseMessages
+        .filter((m) => m.author === "user")
+        .map((m) =>
+          m.chunks.flatMap((c) => (c.kind === "text" ? [c.text] : [])).join("")
+        )
+    )
+  }, [baseMessages])
+
+  useEffect(() => {
     setPendingPrompts((prev) => {
       if (prev.length === 0) return prev
       const next = dropPendingPrompts(thread.id, (entry) =>
-        isPendingPromptConfirmed(entry, thread.messages)
+        userMessageTexts.has(entry.prompt)
       )
       return next.length === prev.length ? prev : next
     })
-  }, [thread.id, thread.messages])
-
-  useEffect(() => {
-    queryClient.setQueryData<Array<AgentThread> | undefined>(
-      agentThreadKeys.all,
-      (threads) =>
-        threads?.map((item) =>
-          item.id === thread.id
-            ? { ...item, ...thread, messages: item.messages }
-            : item
-        )
-    )
-  }, [queryClient, thread])
+  }, [thread.id, userMessageTexts])
 
   const displayMessages = useMemo<Array<Message>>(() => {
-    if (pendingPrompts.length === 0) return thread.messages
+    if (pendingPrompts.length === 0) return baseMessages
+
     const baseTimestamp = new Date().toISOString()
-    const result = thread.messages.slice()
+    const result = baseMessages.slice()
     pendingPrompts.forEach((entry, i) => {
       const chunks: Message["chunks"] = [...(entry.images ?? [])]
       if (entry.prompt) chunks.push({ kind: "text", text: entry.prompt })
@@ -110,13 +123,13 @@ export function AgentThreadView({ thread }: AgentThreadViewProps) {
       result.splice(at, 0, synth)
     })
     return result
-  }, [thread.messages, pendingPrompts])
+  }, [baseMessages, pendingPrompts])
 
   const hasMessages = displayMessages.length > 0
-  const hasActiveRun = thread.status === "running"
-  const isStreaming = hasActiveRun || pendingPrompts.length > 0
-  const settingUpSandbox =
-    hasActiveRun && thread.messages.length === 0 && pendingPrompts.length > 0
+  const isStreaming =
+    thread.status === "running" || stream.isLoading || pendingPrompts.length > 0
+  const isThinking = stream.isLoading || pendingPrompts.length > 0
+  const settingUpSandbox = isThinking && baseMessages.length === 0
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
@@ -126,11 +139,13 @@ export function AgentThreadView({ thread }: AgentThreadViewProps) {
             <MessageView
               messages={displayMessages}
               isStreaming={isStreaming}
+              streamIsLoading={stream.isLoading}
+              isThinking={isThinking}
               settingUpSandbox={settingUpSandbox}
               contentWidthClass="max-w-3xl"
             />
             <div className="shrink-0 px-4 pb-4">
-              <div className="mx-auto w-full max-w-3xl min-w-0">
+              <div className="mx-auto w-full min-w-0 max-w-3xl">
                 <AgentPromptBar
                   placeholder="Add a follow up"
                   compact
